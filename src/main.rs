@@ -47,10 +47,9 @@ struct Args {
     #[arg(short, long, default_value = "..")]
     range: range::EntryRange,
 
-    /// Enable Bitcoin verification using the local node (defaults:
-    /// http://localhost:8332 with ~/.bitcoin/.cookie)
+    /// Skip Bitcoin verification even if a local node is available
     #[arg(long)]
-    btc: bool,
+    no_btc: bool,
 
     /// Bitcoin RPC URL [default: http://localhost:8332]
     #[arg(long, value_name = "URL")]
@@ -79,10 +78,6 @@ async fn main() -> Result<(), AppError> {
     println!("Fetching journal from: {}", journal_url);
     println!("Verifying range: {}", args.range);
 
-    if let Some(ref url) = args.bitcoin_rpc {
-        println!("Bitcoin RPC: {}", url);
-    }
-
     let client = reqwest::Client::builder()
         .user_agent(format!(
             "Temporal-Integrity-Commission-v{}",
@@ -90,8 +85,10 @@ async fn main() -> Result<(), AppError> {
         ))
         .build()?;
 
-    // Optionally connect to a local Bitcoin node.
-    let btc: Option<std::sync::Arc<bitcoincore_rpc::Client>> = if args.btc {
+    // Try to connect to a local Bitcoin node unless the user opted out.
+    let btc: Option<std::sync::Arc<bitcoincore_rpc::Client>> = if args.no_btc {
+        None
+    } else {
         let url = args
             .bitcoin_rpc
             .as_deref()
@@ -106,23 +103,28 @@ async fn main() -> Result<(), AppError> {
                     p.to_string_lossy().into_owned()
                 })
             });
-        let client = verify::connect_btc(
+        match verify::connect_btc(
             url,
             args.bitcoin_rpc_user.as_deref(),
             args.bitcoin_rpc_pass.as_deref(),
             cookie.as_deref(),
-        )
-        .map_err(|e| {
-            eprintln!("ERROR: failed to connect to Bitcoin RPC: {}", e);
-            AppError::BitcoinRpc(e.to_string())
-        })?;
-        println!(
-            "Bitcoin node connected (height: {})",
-            client.get_block_count().unwrap_or(0)
-        );
-        Some(std::sync::Arc::new(client))
-    } else {
-        None
+        ) {
+            Ok(client) => {
+                println!(
+                    "Bitcoin node connected (height: {})",
+                    client.get_block_count().unwrap_or(0)
+                );
+                Some(std::sync::Arc::new(client))
+            }
+            Err(e) => {
+                eprintln!(
+                    "WARNING: could not connect to Bitcoin RPC at {}: {}",
+                    url, e
+                );
+                eprintln!("         Run with --no-btc to suppress this warning.");
+                None
+            }
+        }
     };
 
     // Stream-download the journal so we don't have to buffer the whole thing.
