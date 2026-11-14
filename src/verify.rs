@@ -1,6 +1,5 @@
 use bitcoincore_rpc::{Auth, Client as BtcClient, RpcApi};
 use opentimestamps::attestation::Attestation;
-use opentimestamps::ser::DetachedTimestampFile;
 use opentimestamps::ser::Deserializer;
 use opentimestamps::timestamp::Step;
 use opentimestamps::timestamp::StepData;
@@ -66,27 +65,11 @@ pub async fn verify_timestamp_against_node(
         }
     };
 
-    // Calendar servers may return either a full `.ots` DetachedTimestampFile
-    // or a raw serialized `Timestamp`. Try both.
-    let timestamp = match DetachedTimestampFile::from_reader(&bytes[..]) {
-        Ok(file) => {
-            if file.timestamp.start_digest != expected_commitment {
-                return VerifyResult::ParseError(format!(
-                    "start_digest {} does not match commitment {}",
-                    hex::encode(&file.timestamp.start_digest),
-                    hex::encode(expected_commitment)
-                ));
-            }
-            file.timestamp
-        }
-        Err(_) => {
-            // Try raw Timestamp deserialization.
-            let mut deser = Deserializer::new(&bytes[..]);
-            match Timestamp::deserialize(&mut deser, expected_commitment.to_vec()) {
-                Ok(ts) => ts,
-                Err(e) => return VerifyResult::ParseError(e.to_string()),
-            }
-        }
+    // Calendar servers return a raw serialized `Timestamp` (no .ots wrapper).
+    let mut deser = Deserializer::new(&bytes[..]);
+    let timestamp = match Timestamp::deserialize(&mut deser, expected_commitment.to_vec()) {
+        Ok(ts) => ts,
+        Err(e) => return VerifyResult::ParseError(e.to_string()),
     };
 
     // Build a Bitcoin client if requested (done here so we don't pay the
