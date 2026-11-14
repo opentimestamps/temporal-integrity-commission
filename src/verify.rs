@@ -55,7 +55,8 @@ pub async fn verify_timestamp_against_node(
     expected_commitment: &[u8],
     btc: Option<Arc<BtcClient>>,
 ) -> VerifyResult {
-    let bytes = match download_bytes(client, url.clone()).await {
+    let label = format!("GET {}", url);
+    let bytes = match crate::http::fetch_bytes_with_backoff(client.get(url.clone()), &label).await {
         Ok(b) => b,
         Err(e) => {
             if e.status() == Some(reqwest::StatusCode::NOT_FOUND) {
@@ -91,16 +92,6 @@ pub async fn verify_timestamp_against_node(
     }
 }
 
-async fn download_bytes(
-    client: &reqwest::Client,
-    url: reqwest::Url,
-) -> Result<Vec<u8>, reqwest::Error> {
-    let resp = client.get(url).send().await?;
-    if !resp.status().is_success() {
-        return Err(resp.error_for_status().unwrap_err());
-    }
-    Ok(resp.bytes().await?.to_vec())
-}
 
 #[derive(Debug)]
 enum TreeResult {

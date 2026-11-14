@@ -1,11 +1,8 @@
 use reqwest::{Client, StatusCode};
-use std::time::Duration;
 
 use crate::AppError;
 
 const COMMITMENT_SIZE: usize = 44;
-const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-const MAX_BACKOFF: Duration = Duration::from_secs(600);
 
 /// Returns a stream of 44-byte journal commitments with automatic retry
 /// on interrupted body streams (e.g. IncompleteBody).
@@ -36,7 +33,6 @@ pub fn journal_commitments(
             }
         };
         let mut buffer = Vec::with_capacity(8192);
-        let mut backoff = INITIAL_BACKOFF;
 
         if byte_offset > 0 {
             println!(
@@ -53,10 +49,10 @@ pub fn journal_commitments(
                 req
             };
 
-            let resp = match req.send().await {
+            let label = format!("GET journal from {}", url);
+            let resp = match crate::http::fetch_with_backoff(req, &label).await {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("Error fetching journal from {}: {}", url, e);
                     let _ = tx.send(Err(AppError::Http(e))).await;
                     return;
                 }
@@ -115,14 +111,10 @@ pub fn journal_commitments(
                     }
                     Err(_e) => {
                         eprintln!(
-                            "Journal stream interrupted, backing off {:?} \
-                             before retrying from byte {}...",
-                            backoff, byte_offset
+                            "Journal stream interrupted from byte {}, \
+                             resuming with backoff...",
+                            byte_offset
                         );
-                        tokio::time::sleep(backoff).await;
-                        if backoff < MAX_BACKOFF {
-                            backoff *= 2;
-                        }
                         stream_broken = true;
                         break;
                     }
@@ -146,6 +138,8 @@ pub fn journal_commitments(
                 return;
             }
             // Otherwise loop and retry with updated byte_offset.
+            // The outer loop will issue a new HTTP request starting from
+            // byte_offset, and fetch_with_backoff handles retry/backoff.
         }
     });
 

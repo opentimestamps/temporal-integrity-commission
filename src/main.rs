@@ -5,6 +5,7 @@ use std::io;
 use thiserror::Error;
 use url::Url;
 
+mod http;
 mod journal;
 mod range;
 mod verifier;
