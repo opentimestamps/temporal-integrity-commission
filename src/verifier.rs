@@ -209,6 +209,10 @@ pub async fn verify_chunks(
                         "commitment {} @ {} ... unverified ({})",
                         commitment_num, timestamp_str, reason
                     ));
+                    eprintln!(
+                        "\n  UNVERIFIED: commitment {} ({}): {}",
+                        commitment_num, url_for_log, reason
+                    );
                 }
                 VerifyResult::Missing => {
                     missing.fetch_add(1, Ordering::Relaxed);
