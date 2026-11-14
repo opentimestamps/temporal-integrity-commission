@@ -47,19 +47,24 @@ struct Args {
     #[arg(short, long, default_value = "..")]
     range: range::EntryRange,
 
-    /// Bitcoin RPC URL (e.g. http://localhost:8332)
+    /// Enable Bitcoin verification using the local node (defaults:
+    /// http://localhost:8332 with ~/.bitcoin/.cookie)
+    #[arg(long)]
+    btc: bool,
+
+    /// Bitcoin RPC URL [default: http://localhost:8332]
     #[arg(long, value_name = "URL")]
     bitcoin_rpc: Option<String>,
 
-    /// Bitcoin RPC user name
+    /// Bitcoin RPC user name (alternative to cookie auth)
     #[arg(long, value_name = "USER")]
     bitcoin_rpc_user: Option<String>,
 
-    /// Bitcoin RPC password
+    /// Bitcoin RPC password (alternative to cookie auth)
     #[arg(long, value_name = "PASS")]
     bitcoin_rpc_pass: Option<String>,
 
-    /// Bitcoin RPC cookie file path (overrides user/pass)
+    /// Bitcoin RPC cookie file path [default: ~/.bitcoin/.cookie]
     #[arg(long, value_name = "PATH")]
     bitcoin_rpc_cookie: Option<String>,
 }
@@ -86,26 +91,39 @@ async fn main() -> Result<(), AppError> {
         .build()?;
 
     // Optionally connect to a local Bitcoin node.
-    let btc: Option<std::sync::Arc<bitcoincore_rpc::Client>> =
-        if let Some(ref url) = args.bitcoin_rpc {
-            let client = verify::connect_btc(
-                url,
-                args.bitcoin_rpc_user.as_deref(),
-                args.bitcoin_rpc_pass.as_deref(),
-                args.bitcoin_rpc_cookie.as_deref(),
-            )
-            .map_err(|e| {
-                eprintln!("ERROR: failed to connect to Bitcoin RPC: {}", e);
-                AppError::BitcoinRpc(e.to_string())
-            })?;
-            println!(
-                "Bitcoin node connected (height: {})",
-                client.get_block_count().unwrap_or(0)
-            );
-            Some(std::sync::Arc::new(client))
-        } else {
-            None
-        };
+    let btc: Option<std::sync::Arc<bitcoincore_rpc::Client>> = if args.btc {
+        let url = args
+            .bitcoin_rpc
+            .as_deref()
+            .unwrap_or("http://localhost:8332");
+        let cookie = args
+            .bitcoin_rpc_cookie
+            .as_deref()
+            .map(|p| p.to_string())
+            .or_else(|| {
+                home::home_dir().map(|mut p| {
+                    p.push(".bitcoin/.cookie");
+                    p.to_string_lossy().into_owned()
+                })
+            });
+        let client = verify::connect_btc(
+            url,
+            args.bitcoin_rpc_user.as_deref(),
+            args.bitcoin_rpc_pass.as_deref(),
+            cookie.as_deref(),
+        )
+        .map_err(|e| {
+            eprintln!("ERROR: failed to connect to Bitcoin RPC: {}", e);
+            AppError::BitcoinRpc(e.to_string())
+        })?;
+        println!(
+            "Bitcoin node connected (height: {})",
+            client.get_block_count().unwrap_or(0)
+        );
+        Some(std::sync::Arc::new(client))
+    } else {
+        None
+    };
 
     // Stream-download the journal so we don't have to buffer the whole thing.
     let stream = journal::journal_commitments(client.clone(), journal_url, args.range.start);
