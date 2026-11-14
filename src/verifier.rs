@@ -1,17 +1,21 @@
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
-use reqwest::{Client, StatusCode, Url};
+use reqwest::{Client, Url};
 use std::collections::VecDeque;
 use std::fmt::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::range::EntryRange;
+use crate::verify::{VerifyResult, BtcConn};
 use crate::AppError;
 
 pub struct Stats {
     pub ok: usize,
     pub errors: usize,
     pub missing: usize,
+    pub verified: usize,
+    pub chain_unverified: usize,
+    pub pending: usize,
 }
 
 /// Tracks completion times in a rolling 60-second window.
@@ -56,7 +60,8 @@ impl RateTracker {
     }
 }
 
-/// Verify each 44-byte chunk by concurrently fetching its timestamp.
+/// Verify each 44-byte chunk by concurrently fetching its timestamp proof and
+/// verifying it against a local Bitcoin node when available.
 pub async fn verify_chunks(
     client: &Client,
     base_url: Url,
@@ -65,10 +70,14 @@ pub async fn verify_chunks(
     concurrency: usize,
     verbose: bool,
     range: EntryRange,
+    btc: Option<BtcConn>,
 ) -> Result<Stats, AppError> {
     let ok = Arc::new(AtomicUsize::new(0));
     let errors = Arc::new(AtomicUsize::new(0));
     let missing = Arc::new(AtomicUsize::new(0));
+    let verified = Arc::new(AtomicUsize::new(0));
+    let chain_unverified = Arc::new(AtomicUsize::new(0));
+    let pending = Arc::new(AtomicUsize::new(0));
 
     let rate_tracker = RateTracker::new();
     let latest_url = Arc::new(std::sync::Mutex::new(String::from("starting...")));
@@ -120,21 +129,37 @@ pub async fn verify_chunks(
             hex::encode(&chunk)
         };
 
-        // First 8 bytes are a big-endian Unix timestamp.
+        // First 4 bytes are a big-endian Unix timestamp.
         let timestamp_str = commitment_time(&chunk);
 
+        // Decode hex -> raw bytes for the OTS start_digest check.
+        let commitment_bytes = match hex::decode(&hex) {
+            Ok(b) => b,
+            Err(_) => {
+                processed += 1;
+                commitment_num += 1;
+                continue;
+            }
+        };
+
         let url = base_url
-            .join(&format!("timestamp/{}", &hex))
-            .map_err(|e| AppError::Url(e))?;
+            .join(&format!("timestamp/{}", hex))
+            .map_err(AppError::Url)?;
 
         let client = client.clone();
         let ok = ok.clone();
         let errors = errors.clone();
         let missing = missing.clone();
+        let verified = verified.clone();
+        let chain_unverified = chain_unverified.clone();
+        let pending = pending.clone();
         let pb = pb.clone();
         let permit = semaphore.clone().acquire_owned().await.unwrap();
         let rt = rate_tracker.clone();
         let url_update = latest_url.clone();
+
+        // Clone the lightweight connection config into the task.
+        let btc_conn = btc.clone();
 
         tasks.spawn(async move {
             let _permit = permit;
@@ -143,22 +168,77 @@ pub async fn verify_chunks(
             }
             let url_for_log = url.clone();
             *url_update.lock().unwrap() = url_for_log.to_string();
-            let result = check_timestamp(&client, url).await;
+
+            let result = crate::verify::verify_timestamp_against_node(
+                &client,
+                url,
+                &commitment_bytes,
+                btc_conn.as_ref(),
+            )
+            .await;
+
             rt.record();
             match result {
-                Ok(true) => {
+                VerifyResult::Verified { height } => {
                     ok.fetch_add(1, Ordering::Relaxed);
-                    pb.set_message(format!("commitment {} @ {} ... OK", commitment_num, timestamp_str));
+                    verified.fetch_add(1, Ordering::Relaxed);
+                    pb.set_message(format!(
+                        "commitment {} @ {} ... verified (block {})",
+                        commitment_num, timestamp_str, height
+                    ));
                 }
-                Ok(false) => {
+                VerifyResult::ChainUnverified { height } => {
+                    ok.fetch_add(1, Ordering::Relaxed);
+                    chain_unverified.fetch_add(1, Ordering::Relaxed);
+                    pb.set_message(format!(
+                        "commitment {} @ {} ... chain-unverified (block {})",
+                        commitment_num, timestamp_str, height
+                    ));
+                }
+                VerifyResult::Pending => {
+                    ok.fetch_add(1, Ordering::Relaxed);
+                    pending.fetch_add(1, Ordering::Relaxed);
+                    pb.set_message(format!(
+                        "commitment {} @ {} ... pending",
+                        commitment_num, timestamp_str
+                    ));
+                }
+                VerifyResult::Unverified { reason } => {
+                    ok.fetch_add(1, Ordering::Relaxed);
+                    pb.set_message(format!(
+                        "commitment {} @ {} ... unverified ({})",
+                        commitment_num, timestamp_str, reason
+                    ));
+                }
+                VerifyResult::Missing => {
                     missing.fetch_add(1, Ordering::Relaxed);
-                    pb.set_message(format!("commitment {} @ {} ... MISSING", commitment_num, timestamp_str));
+                    pb.set_message(format!(
+                        "commitment {} @ {} ... MISSING",
+                        commitment_num, timestamp_str
+                    ));
                     eprintln!("\n  MISSING: commitment {} ({})", commitment_num, url_for_log);
                 }
-                Err(e) => {
+                VerifyResult::HttpError(e) => {
                     errors.fetch_add(1, Ordering::Relaxed);
-                    pb.set_message(format!("commitment {} @ {} ... ERROR", commitment_num, timestamp_str));
-                    eprintln!("\n  ERROR fetching commitment {} ({}): {}", commitment_num, url_for_log, e);
+                    pb.set_message(format!(
+                        "commitment {} @ {} ... ERROR",
+                        commitment_num, timestamp_str
+                    ));
+                    eprintln!(
+                        "\n  ERROR fetching commitment {} ({}): {}",
+                        commitment_num, url_for_log, e
+                    );
+                }
+                VerifyResult::ParseError(e) => {
+                    errors.fetch_add(1, Ordering::Relaxed);
+                    pb.set_message(format!(
+                        "commitment {} @ {} ... PARSE ERROR",
+                        commitment_num, timestamp_str
+                    ));
+                    eprintln!(
+                        "\n  PARSE ERROR commitment {} ({}): {}",
+                        commitment_num, url_for_log, e
+                    );
                 }
             }
             pb.inc(1);
@@ -175,6 +255,9 @@ pub async fn verify_chunks(
         ok: ok.load(Ordering::Relaxed),
         errors: errors.load(Ordering::Relaxed),
         missing: missing.load(Ordering::Relaxed),
+        verified: verified.load(Ordering::Relaxed),
+        chain_unverified: chain_unverified.load(Ordering::Relaxed),
+        pending: pending.load(Ordering::Relaxed),
     })
 }
 
@@ -187,17 +270,5 @@ fn commitment_time(chunk: &[u8]) -> String {
     match chrono::DateTime::from_timestamp(secs as i64, 0) {
         Some(t) => t.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
         None => "?".to_string(),
-    }
-}
-
-async fn check_timestamp(client: &Client, url: Url) -> Result<bool, reqwest::Error> {
-    let resp = client.get(url).send().await?;
-    match resp.status() {
-        StatusCode::OK => Ok(true),
-        StatusCode::NOT_FOUND => Ok(false),
-        _ => {
-            resp.error_for_status()?;
-            Ok(true)
-        }
     }
 }

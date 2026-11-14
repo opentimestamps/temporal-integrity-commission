@@ -80,17 +80,13 @@ pub fn journal_commitments(
                     return;
                 } else if !status.is_success() {
                     let _ = tx
-                        .send(Err(AppError::Http(reqwest::Error::from(
-                            resp.error_for_status().unwrap_err(),
-                        ))))
+                        .send(Err(AppError::Http(resp.error_for_status().unwrap_err())))
                         .await;
                     return;
                 }
             } else if !status.is_success() {
                 let _ = tx
-                    .send(Err(AppError::Http(reqwest::Error::from(
-                        resp.error_for_status().unwrap_err(),
-                    ))))
+                    .send(Err(AppError::Http(resp.error_for_status().unwrap_err())))
                     .await;
                 return;
             }
