@@ -1,3 +1,4 @@
+use bitcoincore_rpc::RpcApi;
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::io;
@@ -84,14 +85,27 @@ async fn main() -> Result<(), AppError> {
         ))
         .build()?;
 
-    // Optionally provide Bitcoin RPC connection parameters for cryptographic
-    // verification of timestamp proofs against the local chain.
-    let btc = args.bitcoin_rpc.as_ref().map(|url| verify::BtcConn {
-        url: url.clone(),
-        user: args.bitcoin_rpc_user.clone(),
-        pass: args.bitcoin_rpc_pass.clone(),
-        cookie: args.bitcoin_rpc_cookie.clone(),
-    });
+    // Optionally connect to a local Bitcoin node.
+    let btc: Option<std::sync::Arc<bitcoincore_rpc::Client>> =
+        if let Some(ref url) = args.bitcoin_rpc {
+            let client = verify::connect_btc(
+                url,
+                args.bitcoin_rpc_user.as_deref(),
+                args.bitcoin_rpc_pass.as_deref(),
+                args.bitcoin_rpc_cookie.as_deref(),
+            )
+            .map_err(|e| {
+                eprintln!("ERROR: failed to connect to Bitcoin RPC: {}", e);
+                AppError::BitcoinRpc(e.to_string())
+            })?;
+            println!(
+                "Bitcoin node connected (height: {})",
+                client.get_block_count().unwrap_or(0)
+            );
+            Some(std::sync::Arc::new(client))
+        } else {
+            None
+        };
 
     // Stream-download the journal so we don't have to buffer the whole thing.
     let stream = journal::journal_commitments(client.clone(), journal_url, args.range.start);

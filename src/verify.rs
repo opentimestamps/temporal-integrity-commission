@@ -4,6 +4,7 @@ use opentimestamps::ser::Deserializer;
 use opentimestamps::timestamp::Step;
 use opentimestamps::timestamp::StepData;
 use opentimestamps::timestamp::Timestamp;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum VerifyResult {
@@ -25,26 +26,25 @@ pub enum VerifyResult {
     ParseError(String),
 }
 
-/// Connection parameters for a local Bitcoin node.
-#[derive(Clone)]
-pub struct BtcConn {
-    pub url: String,
-    pub user: Option<String>,
-    pub pass: Option<String>,
-    pub cookie: Option<String>,
-}
-
-impl BtcConn {
-    fn to_client(&self) -> Result<BtcClient, Box<dyn std::error::Error>> {
-        let auth = if let Some(ref path) = self.cookie {
-            Auth::CookieFile(path.into())
-        } else if let (Some(ref u), Some(ref p)) = (&self.user, &self.pass) {
-            Auth::UserPass(u.clone(), p.clone())
-        } else {
-            Auth::None
-        };
-        Ok(BtcClient::new(&self.url, auth)?)
-    }
+/// Build a Bitcoin RPC client from CLI-style credentials and immediately
+/// verify the connection with a lightweight `getblockcount` call.
+pub fn connect_btc(
+    url: &str,
+    user: Option<&str>,
+    pass: Option<&str>,
+    cookie: Option<&str>,
+) -> Result<BtcClient, Box<dyn std::error::Error>> {
+    let auth = if let Some(path) = cookie {
+        Auth::CookieFile(path.into())
+    } else if let (Some(u), Some(p)) = (user, pass) {
+        Auth::UserPass(u.to_string(), p.to_string())
+    } else {
+        Auth::None
+    };
+    let client = BtcClient::new(url, auth)?;
+    // Smoke-test the connection so auth errors surface immediately.
+    let _ = client.get_block_count()?;
+    Ok(client)
 }
 
 /// Download an OpenTimestamps proof from `url`, parse it, and verify any
@@ -53,7 +53,7 @@ pub async fn verify_timestamp_against_node(
     client: &reqwest::Client,
     url: reqwest::Url,
     expected_commitment: &[u8],
-    btc: Option<&BtcConn>,
+    btc: Option<Arc<BtcClient>>,
 ) -> VerifyResult {
     let bytes = match download_bytes(client, url.clone()).await {
         Ok(b) => b,
@@ -72,23 +72,9 @@ pub async fn verify_timestamp_against_node(
         Err(e) => return VerifyResult::ParseError(e.to_string()),
     };
 
-    // Build a Bitcoin client if requested (done here so we don't pay the
-    // cost unless a proof was actually downloaded and parsed successfully).
-    let btc_client = match btc {
-        Some(conn) => match conn.to_client() {
-            Ok(c) => Some(c),
-            Err(e) => {
-                return VerifyResult::Unverified {
-                    reason: format!("failed to connect to Bitcoin node: {}", e),
-                }
-            }
-        },
-        None => None,
-    };
-
     // Walk the proof tree looking for Bitcoin and Pending attestations.
-    let had_node = btc_client.is_some();
-    match walk_tree(&timestamp.first_step, btc_client.as_ref()) {
+    let had_node = btc.is_some();
+    match walk_tree(&timestamp.first_step, btc.as_ref().map(|a| a.as_ref())) {
         TreeResult::BitcoinOk { height, verified } => {
             if verified {
                 VerifyResult::Verified { height }

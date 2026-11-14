@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::range::EntryRange;
-use crate::verify::{VerifyResult, BtcConn};
+use crate::verify::VerifyResult;
 use crate::AppError;
 
 pub struct Stats {
@@ -70,7 +70,7 @@ pub async fn verify_chunks(
     concurrency: usize,
     verbose: bool,
     range: EntryRange,
-    btc: Option<BtcConn>,
+    btc: Option<std::sync::Arc<bitcoincore_rpc::Client>>,
 ) -> Result<Stats, AppError> {
     let ok = Arc::new(AtomicUsize::new(0));
     let errors = Arc::new(AtomicUsize::new(0));
@@ -158,8 +158,8 @@ pub async fn verify_chunks(
         let rt = rate_tracker.clone();
         let url_update = latest_url.clone();
 
-        // Clone the lightweight connection config into the task.
-        let btc_conn = btc.clone();
+        // Clone the shared Bitcoin client reference into the task.
+        let btc_arc = btc.clone();
 
         tasks.spawn(async move {
             let _permit = permit;
@@ -173,7 +173,7 @@ pub async fn verify_chunks(
                 &client,
                 url,
                 &commitment_bytes,
-                btc_conn.as_ref(),
+                btc_arc,
             )
             .await;
 
