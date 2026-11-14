@@ -1,9 +1,11 @@
 use reqwest::{Client, StatusCode};
+use std::time::Duration;
 
 use crate::AppError;
 
 const COMMITMENT_SIZE: usize = 44;
-const MAX_RETRIES: usize = 5;
+const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_BACKOFF: Duration = Duration::from_secs(600);
 
 /// Returns a stream of 44-byte journal commitments with automatic retry
 /// on interrupted body streams (e.g. IncompleteBody).
@@ -34,7 +36,7 @@ pub fn journal_commitments(
             }
         };
         let mut buffer = Vec::with_capacity(8192);
-        let mut retries = 0;
+        let mut backoff = INITIAL_BACKOFF;
 
         if byte_offset > 0 {
             println!(
@@ -115,21 +117,18 @@ pub fn journal_commitments(
                             }
                         }
                     }
-                    Err(e) => {
-                        if retries < MAX_RETRIES {
-                            retries += 1;
-                            eprintln!(
-                                "Journal stream interrupted (retry {}/{}), \
-                                 resuming from byte {}...",
-                                retries, MAX_RETRIES, byte_offset
-                            );
-                            stream_broken = true;
-                            break;
-                        } else {
-                            eprintln!("Error reading journal body from {}: {}", url, e);
-                            let _ = tx.send(Err(AppError::Http(e))).await;
-                            return;
+                    Err(_e) => {
+                        eprintln!(
+                            "Journal stream interrupted, backing off {:?} \
+                             before retrying from byte {}...",
+                            backoff, byte_offset
+                        );
+                        tokio::time::sleep(backoff).await;
+                        if backoff < MAX_BACKOFF {
+                            backoff *= 2;
                         }
+                        stream_broken = true;
+                        break;
                     }
                 }
             }
